@@ -543,6 +543,87 @@ void writeWord_GBA(unsigned long myAddress, word myWord) {
   PORTH |= (1 << 3);
 }
 
+void setSeqAddress_GBA(unsigned long myAddress) {
+  // Set address/data ports to output
+  DDRF = 0xFF;
+  DDRK = 0xFF;
+  DDRC = 0xFF;
+
+  // Divide address by two to get word addressing
+  myAddress = myAddress >> 1;
+
+  // Output address to address pins,
+  PORTF = myAddress;
+  PORTK = myAddress >> 8;
+  PORTC = myAddress >> 16;
+
+  // Pull CS(PH3) to LOW
+  PORTH &= ~(1 << 3);
+
+  // Set address/data ports to input
+  PORTF = 0x0;
+  PORTK = 0x0;
+  DDRF = 0x0;
+  DDRK = 0x0;
+}
+
+word seqReadWord_GBA() {
+  // Set address/data ports to input
+  DDRF = 0x00;
+  DDRK = 0x00;
+  DDRC = 0x00;
+
+  // Pull RD(PH6) to LOW
+  PORTH &= ~(1 << 6);
+
+  // Delay here or read error with repro
+   __asm__("nop\n\t"
+          "nop\n\t"
+          "nop\n\t"
+          "nop\n\t");
+
+  word myWord = (PINK << 8) | PINF;
+
+  // Switch RD(PH6) to HIGH
+  PORTH |= (1 << 6);
+
+  return myWord;
+}
+
+void seqWriteWord_GBA(word myWord) {
+  // Set address/data ports to output
+  DDRF = 0xFF;
+  DDRK = 0xFF;
+  DDRC = 0xFF;
+
+ __asm__("nop\n\t"
+          "nop\n\t");
+
+  // Output data
+  PORTF = myWord & 0xFF;
+  PORTK = myWord >> 8;
+
+  // Pull WR(PH5) to LOW
+  PORTH &= ~(1 << 5);
+
+ __asm__("nop\n\t"
+          "nop\n\t");
+
+  // Switch WR(PH5) to HIGH
+  PORTH |= (1 << 5);
+}
+
+void endSeqRW_GBA() {
+  // Switch CS_ROM(PH3) to HIGH
+  PORTH |= (1 << 3);
+
+  // Set address/data ports to input
+  PORTF = 0x0;
+  PORTK = 0x0;
+  DDRF = 0x0;
+  DDRK = 0x0;
+}
+
 // This function swaps bit at positions p1 and p2 in an integer n
 word swapBits(word n, word p1, word p2) {
   // Move p1'th to rightmost side
@@ -962,22 +1043,26 @@ void readROM_GBA() {
   draw_progressbar(0, totalProgressBar);
 
   // Read rom
-  for (unsigned long myAddress = 0; myAddress < cartSize; myAddress += 512) {
-    // Blink led
-    if (myAddress % 16384 == 0)
-      blinkLED();
+  //re-set address occasionally, to prevent corruption.
+  for (unsigned long myAddress = 0; myAddress < cartSize; myAddress += 512 * 8) {
+    setSeqAddress_GBA(myAddress);
 
-    for (int currWord = 0; currWord < 512; currWord += 2) {
-      word tempWord = readWord_GBA(myAddress + currWord);
-      sdBuffer[currWord] = tempWord & 0xFF;
-      sdBuffer[currWord + 1] = (tempWord >> 8) & 0xFF;
+    for (int ixe = 0; ixe < 8; ixe += 1) {
+      for (int currWord = 0; currWord < 512; currWord += 2) {
+        word tempWord = seqReadWord_GBA();
+        sdBuffer[currWord] = tempWord & 0xFF;
+        sdBuffer[currWord + 1] = (tempWord >> 8) & 0xFF;
+      }
+
+      // Write to SD
+      myFile.write(sdBuffer, 512);
+
+      processedProgressBar += 512;
+      draw_progressbar(processedProgressBar, totalProgressBar);
     }
 
-    // Write to SD
-    myFile.write(sdBuffer, 512);
-
-    processedProgressBar += 512;
-    draw_progressbar(processedProgressBar, totalProgressBar);
+    endSeqRW_GBA();
+    delayMicroseconds(15);
   }
 
   // Fix unmapped ROM area of cartridges with 32 MB ROM + EEPROM save type
@@ -2474,13 +2559,19 @@ void writeMSP55LV128_GBA() {
         // Write word count (minus 1)
         writeWord_GAB(currSector, 0xF);
 
+        // Prep for sequential write
+        setSeqAddress_GBA(currSector + currSdBuffer + currWriteBuffer);
+
         // Write buffer
         word currWord;
         for (byte currByte = 0; currByte < 32; currByte += 2) {
           // Join two bytes into one word
           currWord = ((sdBuffer[currWriteBuffer + currByte + 1] & 0xFF) << 8) | (sdBuffer[currWriteBuffer + currByte] & 0xFF);
-          writeWord_GBA(currSector + currSdBuffer + currWriteBuffer + currByte, currWord);
+          seqWriteWord_GBA(currWord);
         }
+
+        //End sequential write
+        endSeqRW_GBA();
 
         // Confirm write buffer
         writeWord_GAB(currSector, 0x29);
@@ -2560,17 +2651,19 @@ boolean verifyFlashrom_GBA() {
         // Fill SD buffer
         myFile.read(sdBuffer, 512);
 
+        setSeqAddress_GBA(currSector + currSdBuffer);
         for (int currByte = 0; currByte < 512; currByte += 2) {
           // Join two bytes into one word
           word currWord = ((sdBuffer[currByte + 1] & 0xFF) << 8) | (sdBuffer[currByte] & 0xFF);
 
           // Compare both
-          if (readWord_GBA(currSector + currSdBuffer + currByte) != currWord) {
+          if (seqReadWord_GBA() != currWord) {
             writeErrors++;
             myFile.close();
             return 0;
           }
         }
+        endSeqRW_GBA();
       }
     }
     // Close the file:
